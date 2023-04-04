@@ -47,7 +47,7 @@
       "network": "mumbai"
     },
     "matic": {
-      "registry": "0x71ca3721bc5bb38f42e066d378a91983448de356",
+      "registry": "0xa25c850aec5048c0ba63ebb972f80cabaf742564",
       "appName": "token-manager.aragonpm.eth",
       "network": "matic"
     },
