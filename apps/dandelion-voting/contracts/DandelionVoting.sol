@@ -7,26 +7,26 @@ pragma solidity 0.4.24;
 import "@aragon/os/contracts/apps/AragonApp.sol";
 import "@aragon/os/contracts/common/IForwarder.sol";
 import "@aragon/os/contracts/acl/IACLOracle.sol";
-
+import "@aragon/os/contracts/lib/token/ERC20.sol";
 import "@aragon/os/contracts/lib/math/SafeMath.sol";
 import "@aragon/os/contracts/lib/math/SafeMath64.sol";
-
 import "@aragon/minime/contracts/MiniMeToken.sol";
 import "@1hive/apps-token-manager/contracts/TokenManagerHook.sol";
+import "./SigUtils.sol";
 
 
-contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp {
+contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp, SigUtils {
     using SafeMath for uint256;
     using SafeMath64 for uint64;
 
     bytes32 public constant CREATE_VOTES_ROLE = keccak256("CREATE_VOTES_ROLE");
     bytes32 public constant MODIFY_SUPPORT_ROLE = keccak256("MODIFY_SUPPORT_ROLE");
     bytes32 public constant MODIFY_QUORUM_ROLE = keccak256("MODIFY_QUORUM_ROLE");
-    bytes32 public constant MODIFY_BUFFER_BLOCKS_ROLE = keccak256("MODIFY_BUFFER_BLOCKS_ROLE");
     bytes32 public constant MODIFY_EXECUTION_DELAY_ROLE = keccak256("MODIFY_EXECUTION_DELAY_ROLE");
+    bytes32 public constant MODIFY_MIN_OPEN_VOTE_AMOUNT_ROLE = keccak256("MODIFY_MIN_OPEN_VOTE_AMOUNT_ROLE");
+    bytes32 public constant MODIFY_FORWARDER_ROLE = keccak256("MODIFY_FORWARDER_ROLE");
 
     uint64 public constant PCT_BASE = 10 ** 18; // 0% = 0; 1% = 10^16; 100% = 10^18
-    uint8 private constant EXECUTION_PERIOD_FALLBACK_DIVISOR = 2;
 
     string private constant ERROR_VOTE_ID_ZERO = "DANDELION_VOTING_VOTE_ID_ZERO";
     string private constant ERROR_NO_VOTE = "DANDELION_VOTING_NO_VOTE";
@@ -41,13 +41,15 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
     string private constant ERROR_ORACLE_SENDER_MISSING = "DANDELION_VOTING_ORACLE_SENDER_MISSING";
     string private constant ERROR_ORACLE_SENDER_TOO_BIG = "DANDELION_VOTING_ORACLE_SENDER_TOO_BIG";
     string private constant ERROR_ORACLE_SENDER_ZERO = "DANDELION_VOTING_ORACLE_SENDER_ZERO";
+    string private constant ERROR_CAN_NOT_OPEN_VOTE = "DANDELION_VOTING_CAN_NOT_OPEN_VOTE";
+    string private constant ERROR_NOT_FORWARDER = "DANDELION_VOTING_NOT_FORWARDER";
 
     enum VoterState { Absent, Yea, Nay }
 
     struct Vote {
         bool executed;
-        uint64 startBlock;
-        uint64 executionBlock;
+        uint64 startDate;
+        uint64 executionDate;
         uint64 snapshotBlock;
         uint64 supportRequiredPct;
         uint64 minAcceptQuorumPct;
@@ -60,22 +62,24 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
     MiniMeToken public token;
     uint64 public supportRequiredPct;
     uint64 public minAcceptQuorumPct;
-    uint64 public durationBlocks;
-    uint64 public bufferBlocks;
-    uint64 public executionDelayBlocks;
+    uint64 public duration;
+    uint64 public executionDelay;
+    uint256 public minOpenVoteAmount;
+    uint256 public votesLength;
+    address public forwarder; // This is the pNetwork forwarder which allows the crosschain voting
 
     // We are mimicing an array, we use a mapping instead to make app upgrade more graceful
     mapping (uint256 => Vote) internal votes;
-    uint256 public votesLength;
-    mapping (address => uint256) public latestYeaVoteId;
+    mapping (address => uint256) public latestYeaVoteId;    
 
     event StartVote(uint256 indexed voteId, address indexed creator, string metadata);
     event CastVote(uint256 indexed voteId, address indexed voter, bool supports, uint256 stake);
     event ExecuteVote(uint256 indexed voteId);
     event ChangeSupportRequired(uint64 supportRequiredPct);
     event ChangeMinQuorum(uint64 minAcceptQuorumPct);
-    event ChangeBufferBlocks(uint64 bufferBlocks);
-    event ChangeExecutionDelayBlocks(uint64 executionDelayBlocks);
+    event ChangeExecutionDelay(uint64 executionDelay);
+    event ChangeMinOpenVoteAmount(uint256 minOpenVoteAmount);
+    event ChangeForwarder(address forwarder);
 
     modifier voteExists(uint256 _voteId) {
         require(_voteId != 0, ERROR_VOTE_ID_ZERO);
@@ -83,22 +87,26 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
         _;
     }
 
+    modifier onlyForwarder() {
+        require(msg.sender == forwarder, ERROR_NOT_FORWARDER);
+        _;
+    }
+
     /**
-    * @notice Initialize Voting app with `_token.symbol(): string` for governance, minimum support of `@formatPct(_supportRequiredPct)`%, minimum acceptance quorum of `@formatPct(_minAcceptQuorumPct)`%, a voting duration of `_voteDurationBlocks` blocks, and a vote buffer of `_voteBufferBlocks` blocks
+    * @notice Initialize Voting app with `_token.symbol(): string` for governance, minimum support of `@formatPct(_supportRequiredPct)`%, minimum acceptance quorum of `@formatPct(_minAcceptQuorumPct)`%, a voting duration of `_voteDuration` seconds
     * @param _token MiniMeToken Address that will be used as governance token
     * @param _supportRequiredPct Percentage of yeas in casted votes for a vote to succeed (expressed as a percentage of 10^18; eg. 10^16 = 1%, 10^18 = 100%)
     * @param _minAcceptQuorumPct Percentage of yeas in total possible votes for a vote to succeed (expressed as a percentage of 10^18; eg. 10^16 = 1%, 10^18 = 100%)
-    * @param _durationBlocks Blocks that a vote will be open for token holders to vote
-    * @param _bufferBlocks Minimum number of blocks between the start block of each vote
-    * @param _executionDelayBlocks Minimum number of blocks between the end of a vote and when it can be executed
+    * @param _duration Seconds that a vote will be open for token holders to vote
+    * @param _executionDelay Minimum number of seconds between the end of a vote and when it can be executed
     */
     function initialize(
         MiniMeToken _token,
         uint64 _supportRequiredPct,
         uint64 _minAcceptQuorumPct,
-        uint64 _durationBlocks,
-        uint64 _bufferBlocks,
-        uint64 _executionDelayBlocks
+        uint64 _duration,
+        uint64 _executionDelay,
+        address _forwarder
     )
         external
         onlyInit
@@ -111,9 +119,9 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
         token = _token;
         supportRequiredPct = _supportRequiredPct;
         minAcceptQuorumPct = _minAcceptQuorumPct;
-        durationBlocks = _durationBlocks;
-        bufferBlocks = _bufferBlocks;
-        executionDelayBlocks = _executionDelayBlocks;
+        duration = _duration;
+        executionDelay = _executionDelay;
+        forwarder = _forwarder;
     }
 
     /**
@@ -145,26 +153,36 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
         emit ChangeMinQuorum(_minAcceptQuorumPct);
     }
 
+
     /**
-    * @notice Change vote buffer to `_voteBufferBlocks` blocks
-    * @param _bufferBlocks New vote buffer defined in blocks
+    * @notice Change execution delay to `_executionDelay` seconds
+    * @param _executionDelay New vote execution delay defined in seconds
     */
-    function changeBufferBlocks(uint64 _bufferBlocks) external auth(MODIFY_BUFFER_BLOCKS_ROLE) {
-        bufferBlocks = _bufferBlocks;
-        emit ChangeBufferBlocks(_bufferBlocks);
+    function changeExecutionDelay(uint64 _executionDelay) external auth(MODIFY_EXECUTION_DELAY_ROLE) {
+        executionDelay = _executionDelay;
+        emit ChangeExecutionDelay(_executionDelay);
     }
 
     /**
-    * @notice Change execution delay to `_executionDelayBlocks` blocks
-    * @param _executionDelayBlocks New vote execution delay defined in blocks
+    * @notice Change token minimum amount required to open a vote.
+    * @param _minOpenVoteAmount New minimum amount of token required to open a vote
     */
-    function changeExecutionDelayBlocks(uint64 _executionDelayBlocks) external auth(MODIFY_EXECUTION_DELAY_ROLE) {
-        executionDelayBlocks = _executionDelayBlocks;
-        emit ChangeExecutionDelayBlocks(_executionDelayBlocks);
+    function changeMinOpenVoteAmount(uint256 _minOpenVoteAmount) external auth(MODIFY_MIN_OPEN_VOTE_AMOUNT_ROLE) {
+        minOpenVoteAmount = _minOpenVoteAmount;
+        emit ChangeMinOpenVoteAmount(_minOpenVoteAmount);
     }
 
     /**
-    * @notice Create a new vote about "`_metadata`"
+    * @notice Change the forwarder address.
+    * @param _forwarder New forwarder address
+    */
+    function changeForwarder(address _forwarder) external auth(MODIFY_FORWARDER_ROLE) {
+        forwarder = _forwarder;
+        emit ChangeForwarder(_forwarder);
+    }
+
+    /**
+    * @notice Create a new vote about "`_metadata`" if the msg.sender owns a certain amount of TOKEN
     * @param _executionScript EVM script to be executed on approval
     * @param _metadata Vote metadata
     * @param _castVote Whether to also cast newly created vote
@@ -172,10 +190,31 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
     */
     function newVote(bytes _executionScript, string _metadata, bool _castVote)
         external
-        auth(CREATE_VOTES_ROLE)
         returns (uint256 voteId)
     {
-        return _newVote(_executionScript, _metadata, _castVote);
+        if (ERC20(token).balanceOf(msg.sender) >= minOpenVoteAmount) {
+            return _newVote(_executionScript, _metadata, _castVote);
+        }
+
+        if (canPerform(msg.sender, CREATE_VOTES_ROLE, arr())) {
+            return _newVote(_executionScript, _metadata, _castVote);
+        }
+
+        revert(ERROR_CAN_NOT_OPEN_VOTE);
+    }
+
+    /**
+    * @notice Vote `_supports ? 'yes' : 'no'` in vote #`_voteId`
+    * @dev Initialization check is implicitly provided by voteExists()` as new votes can only be
+    *      created via `newVote(),` which requires initialization.
+    *      This function enables the multichain voting in fact can only be called by the forwarder
+    * @param _voter Voter
+    * @param _voteId Id for vote
+    * @param _supports Whether voter supports the vote
+    */
+    function delegateVote(address _voter, uint256 _voteId, bool _supports) external onlyForwarder voteExists(_voteId) {
+        require(_canVote(_voteId, _voter), ERROR_CAN_NOT_VOTE);
+        _vote(_voteId, _supports, _voter);
     }
 
     /**
@@ -257,6 +296,32 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
         return _noRecentPositiveVotes(address(_how[0]));
     }
 
+    /**
+     * @notice Vote for a third party (address from sig) if the provided signature is valid
+     * @param _voteId vote id
+     * @param _supports support to the vote
+     * @param _sig signature
+     */
+    function voteFor(
+        uint256 _voteId,
+        bool _supports,
+        bytes _sig
+    )
+        external 
+    {
+        bytes32 message = prefixed(
+            keccak256(
+                msg.sender,
+                _voteId,
+                _supports,
+                this
+            )
+        );
+        address applicant = recoverSigner(message, _sig);
+        require(_canVote(_voteId, applicant), ERROR_CAN_NOT_VOTE);
+        _vote(_voteId, _supports, applicant);
+    }
+
     // Token Manager Hook fns
 
     /**
@@ -295,8 +360,8 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
     * @param _voteId Vote identifier
     * @return Vote open status
     * @return Vote executed status
-    * @return Vote start block
-    * @return Vote snapshot block
+    * @return Vote start date
+    * @return Vote snapshot date
     * @return Vote support required
     * @return Vote minimum acceptance quorum
     * @return Vote yeas amount
@@ -311,8 +376,8 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
         returns (
             bool open,
             bool executed,
-            uint64 startBlock,
-            uint64 executionBlock,
+            uint64 startDate,
+            uint64 executionDate,
             uint64 snapshotBlock,
             uint64 supportRequired,
             uint64 minAcceptQuorum,
@@ -326,8 +391,8 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
 
         open = _isVoteOpen(vote_);
         executed = vote_.executed;
-        startBlock = vote_.startBlock;
-        executionBlock = vote_.executionBlock;
+        startDate = vote_.startDate;
+        executionDate = vote_.executionDate;
         snapshotBlock = vote_.snapshotBlock;
         votingPower = token.totalSupplyAt(vote_.snapshotBlock);
         supportRequired = vote_.supportRequiredPct;
@@ -354,17 +419,14 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
     */
     function _newVote(bytes _executionScript, string _metadata, bool _castVote) internal returns (uint256 voteId) {
         voteId = ++votesLength; // Increment votesLength before assigning to votedId. The first voteId is 1.
-
-        uint64 previousVoteStartBlock = votes[voteId - 1].startBlock;
-        uint64 earliestStartBlock = previousVoteStartBlock == 0 ? 0 : previousVoteStartBlock.add(bufferBlocks);
-        uint64 startBlock = earliestStartBlock < getBlockNumber64() ? getBlockNumber64() : earliestStartBlock;
-
-        uint64 executionBlock = startBlock.add(durationBlocks).add(executionDelayBlocks);
+        
+        uint64 startDate = getTimestamp64();
+        uint64 executionDate = startDate.add(duration).add(executionDelay);
 
         Vote storage vote_ = votes[voteId];
-        vote_.startBlock = startBlock;
-        vote_.executionBlock = executionBlock;
-        vote_.snapshotBlock = startBlock - 1; // avoid double voting in this very block
+        vote_.startDate = startDate;
+        vote_.executionDate = executionDate;
+        vote_.snapshotBlock = getBlockNumber64() - 1; // avoid double voting in this very block
         vote_.supportRequiredPct = supportRequiredPct;
         vote_.minAcceptQuorumPct = minAcceptQuorumPct;
         vote_.executionScript = _executionScript;
@@ -410,7 +472,7 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
         }
 
         // This will always be later than the end of the previous vote
-        if (getBlockNumber64() < vote_.executionBlock) {
+        if (getTimestamp64() < vote_.executionDate) {
             return false;
         }
 
@@ -461,8 +523,8 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
     */
     function _isVoteOpen(Vote storage vote_) internal view returns (bool) {
         uint256 votingPowerAtSnapshot = token.totalSupplyAt(vote_.snapshotBlock);
-        uint64 blockNumber = getBlockNumber64();
-        return votingPowerAtSnapshot > 0 && blockNumber >= vote_.startBlock && blockNumber < vote_.startBlock.add(durationBlocks);
+        uint64 timestamp = getTimestamp64();
+        return votingPowerAtSnapshot > 0 && timestamp >= vote_.startDate && timestamp < vote_.startDate.add(duration);
     }
 
     /**
@@ -491,14 +553,10 @@ contract DandelionVoting is IForwarder, IACLOracle, TokenManagerHook, AragonApp 
 
         uint256 senderLatestYeaVoteId = latestYeaVoteId[_sender];
         Vote storage senderLatestYeaVote_ = votes[senderLatestYeaVoteId];
-        uint64 blockNumber = getBlockNumber64();
 
         bool senderLatestYeaVoteFailed = !_votePassed(senderLatestYeaVote_);
-        bool senderLatestYeaVoteExecutionBlockPassed = blockNumber >= senderLatestYeaVote_.executionBlock;
+        bool senderLatestYeaVoteExecutionBlockPassed = getTimestamp64() >= senderLatestYeaVote_.executionDate;
 
-        uint64 fallbackPeriodLength = bufferBlocks / EXECUTION_PERIOD_FALLBACK_DIVISOR;
-        bool senderLatestYeaVoteFallbackPeriodPassed = blockNumber > senderLatestYeaVote_.executionBlock.add(fallbackPeriodLength);
-
-        return senderLatestYeaVoteFailed && senderLatestYeaVoteExecutionBlockPassed || senderLatestYeaVote_.executed || senderLatestYeaVoteFallbackPeriodPassed;
+        return senderLatestYeaVoteFailed && senderLatestYeaVoteExecutionBlockPassed || senderLatestYeaVote_.executed;
     }
 }
