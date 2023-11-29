@@ -70,6 +70,13 @@
       "registry": "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e",
       "appName": "finance.aragonpm.eth",
       "network": "goerli"
+    },
+    "xdai": {
+      "registry": "0xC2463283b05e20C9fa697A8C8647eC645146BfEe",
+      "appName": "finance.aragonpm.eth",
+      "network": "xdai",
+      "gasPrice": 10e9,
+      "gasLimit": 2e6
     }
   },
   "dependencies": [
